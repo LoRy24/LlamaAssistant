@@ -41,7 +41,7 @@ minuti.
 
 ```
 raspai/
-├── voice_assistant.py     # applicazione principale
+├── main.py                # applicazione principale
 ├── setup.sh               # installazione
 ├── run.sh                 # avvio
 ├── requirements.txt       # pacchetti Python
@@ -58,6 +58,6 @@ raspai/
   automaticamente nel menu "modello" dell'app.
 - Se Piper non e' disponibile, l'app ripiega su `espeak-ng` (voce robotica).
 - Se il microfono non viene rilevato, controlla `arecord -l` e modifica
-  `ARECORD_DEVICE` in cima a `voice_assistant.py`.
+  `ARECORD_DEVICE` in cima a `main.py`.
 - I percorsi sono relativi al repository; per usarne altri si puo'
   impostare la variabile d'ambiente `RASPAI_HOME`.
