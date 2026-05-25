@@ -1,43 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Assistente vocale offline per Raspberry Pi
-==========================================
-Parla con un modello AI (Qwen 1.5B) gestito da llama.cpp.
+RaspAI - Assistente vocale offline per Raspberry Pi
+===================================================
+Parla con un modello AI (Qwen e altri) gestito da llama.cpp.
 Interfaccia ottimizzata per schermo VERTICALE 600 x 1024 px.
 
-Catena: microfono -> whisper.cpp -> llama-server -> espeak-ng
+Catena: microfono -> whisper.cpp -> llama-server -> Piper (o espeak-ng)
+
+--------------------------------------------------------------------
+INSTALLAZIONE DELLA VOCE PIPER (voce umana, offline)
+--------------------------------------------------------------------
+Lo script setup.sh installa Piper e la voce automaticamente.
+Per farlo a mano: la voce va nella cartella  piper/  del repository.
+Se Piper o il file voce non ci sono, l'app usa automaticamente espeak-ng.
+Altre voci italiane disponibili su HuggingFace (rhasspy/piper-voices):
+  it_IT-riccardo-x_low  (maschile, leggera)
+--------------------------------------------------------------------
 
 Dipendenze di sistema:
     sudo apt install espeak-ng alsa-utils python3-tk
-
-llama-server deve essere compilato insieme a llama.cpp
-(di solito in llama.cpp/build/bin/llama-server).
 """
 
 import os
+import re
 import sys
 import json
 import time
+import math
 import signal
 import threading
 import subprocess
 import tempfile
 import shutil
+import glob
 import urllib.request
 import urllib.error
 import tkinter as tk
 from tkinter import font as tkfont
 
 # ============================================================
-# CONFIGURAZIONE  -  modifica qui i percorsi se necessario
+# CONFIGURAZIONE
 # ============================================================
-BASE          = "/home/pi"
+# I percorsi sono RELATIVI alla cartella del repository: lo script di
+# installazione (setup.sh) mette tutto qui dentro, quindi il progetto e'
+# autocontenuto e portabile. Si puo' forzare un'altra base con la
+# variabile d'ambiente RASPAI_HOME.
+BASE = os.environ.get(
+    "RASPAI_HOME",
+    os.path.dirname(os.path.abspath(__file__))
+)
+
 WHISPER       = f"{BASE}/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = f"{BASE}/whisper.cpp/models/ggml-base.bin"
 
 LLAMA_SERVER  = f"{BASE}/llama.cpp/build/bin/llama-server"
-LLAMA_MODEL   = f"{BASE}/llama.cpp/models/qwen1.5b.gguf"
+MODELS_DIR    = f"{BASE}/models"                     # cartella scandita per i .gguf
+DEFAULT_MODEL = f"{MODELS_DIR}/qwen1.5b.gguf"        # modello iniziale
 
 LLAMA_HOST    = "127.0.0.1"
 LLAMA_PORT    = 8080
@@ -47,6 +66,11 @@ LLAMA_CTX     = 2048
 ARECORD_DEVICE = "default"   # "default" oppure es. "plughw:1,0" -- vedi `arecord -l`
 WHISPER_LANG   = "it"
 
+
+# --- Voce Piper (umana). Se mancano, fallback automatico a espeak-ng ---
+PIPER_MODEL = f"{BASE}/piper/it_IT-paola-medium.onnx"
+
+# --- Voce espeak-ng (ripiego robotico) ---
 TTS_VOICE = "it"
 TTS_SPEED = 160
 
@@ -60,29 +84,76 @@ SYSTEM_PROMPT = (
 )
 
 # ============================================================
-# PALETTE  -  tema scuro caldo (carbone/talpa, accento salvia)
+# PALETTE  -  scuro morbido con accenti NEON
 # ============================================================
-COL_BG      = "#21201d"   # carbone caldo
-COL_PANEL   = "#2b2a26"   # pannelli
-COL_CARD    = "#302e2a"   # card della risposta
-COL_LINE    = "#3d3a35"   # bordi sottili
-COL_ACCENT  = "#a8c0a0"   # salvia tenue
-COL_ACCENT2 = "#d8a48f"   # terracotta soft
-COL_TEXT    = "#ece8e1"   # testo principale (avorio)
-COL_MUTE    = "#938d82"   # testo secondario
-COL_DIM     = "#5f5b53"   # indicatore spento
-COL_OK      = "#8bb48a"   # verde soft
-COL_WARN    = "#d8a48f"   # ambra/terracotta
-COL_ERR     = "#c98a82"   # rosso soft
+COL_BG       = "#15151f"   # blu-nero profondo morbido
+COL_PANEL    = "#1d1d2b"   # pannelli
+COL_CARD     = "#21212f"   # superfici card
+COL_LINE     = "#2e2e42"   # bordi sottili
+COL_TEXT     = "#f0eef7"   # testo principale
+COL_MUTE     = "#8b88a3"   # testo secondario
+
+COL_NEON     = "#00e5d4"   # ciano neon (accento principale)
+COL_NEON2    = "#b06bff"   # viola neon (accento secondario)
+COL_NEON_PK  = "#ff5fa2"   # rosa neon
+
+COL_USER_BUB = "#2a2540"   # bolla utente (viola scuro)
+COL_AI_BUB   = "#10303a"   # bolla AI (ciano scuro)
+
+COL_OK       = "#5fffd0"   # verde-ciano (servizio ok)
+COL_WARN     = "#ffcf6b"   # ambra
+COL_ERR      = "#ff7a8a"   # rosso soft
+COL_DIM      = "#44445c"   # indicatore spento
+
+
+# ------------------------------------------------------------
+# Utilita': nomi modello semplificati
+# ------------------------------------------------------------
+def pretty_model_name(path):
+    """Trasforma un nome file .gguf in un'etichetta leggibile.
+    es. 'qwen2.5-1.5b-instruct-q4_k_m.gguf' -> 'Qwen2.5 1.5b'
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    # togli suffissi di quantizzazione e tag tecnici comuni
+    junk = ["instruct", "chat", "gguf", "ggml", "f16", "fp16", "bf16",
+            "mini", "base", "it", "en"]
+    junk += [f"q{n}" for n in range(2, 9)]
+    # separa su -, _ e spazi; il PUNTO non separa se sta tra due cifre
+    # (cosi' '2.5' resta unito ma 'v1.0.gguf' viene gestito a parte)
+    tmp = re.sub(r"(?<!\d)\.(?!\d)", " ", name)   # punti non-decimali -> spazio
+    parts = re.split(r"[-_\s]+", tmp)
+    kept = []
+    for p in parts:
+        pl = p.lower()
+        if not p:
+            continue
+        if pl in junk:
+            continue
+        if re.fullmatch(r"q\d(\.\d+)?(_[a-z0-9]+)*", pl):  # q4_k_m, q8_0 ...
+            continue
+        if re.fullmatch(r"k|m|s|l|xl|xs", pl):              # lettere di quant
+            continue
+        if re.fullmatch(r"v\d+(\.\d+)*", pl):               # tag versione vX.Y
+            continue
+        if "q" in pl and re.search(r"q\d", pl):             # token con quant dentro
+            continue
+        kept.append(p)
+    if not kept:
+        kept = [name]
+    # tieni al massimo i primi 3 token: di solito 'famiglia + versione + size'
+    label = " ".join(kept[:3])
+    label = label[:1].upper() + label[1:]
+    return label.strip()
 
 
 # ============================================================
 # GESTIONE DEL SERVER LLAMA
 # ============================================================
 class LlamaServer:
-    """Avvia e mantiene caldo llama-server in background."""
+    """Avvia, riavvia e mantiene caldo llama-server in background."""
 
-    def __init__(self):
+    def __init__(self, model_path):
+        self.model_path = model_path
         self.proc = None
         self.url_completion = f"http://{LLAMA_HOST}:{LLAMA_PORT}/completion"
         self.url_health     = f"http://{LLAMA_HOST}:{LLAMA_PORT}/health"
@@ -101,11 +172,11 @@ class LlamaServer:
         if not os.path.exists(LLAMA_SERVER):
             raise FileNotFoundError(
                 f"llama-server non trovato in:\n{LLAMA_SERVER}")
-        if not os.path.exists(LLAMA_MODEL):
-            raise FileNotFoundError(f"Modello non trovato:\n{LLAMA_MODEL}")
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"Modello non trovato:\n{self.model_path}")
         cmd = [
             LLAMA_SERVER,
-            "-m", LLAMA_MODEL,
+            "-m", self.model_path,
             "--host", LLAMA_HOST,
             "--port", str(LLAMA_PORT),
             "-t", str(LLAMA_THREADS),
@@ -124,6 +195,18 @@ class LlamaServer:
                 raise RuntimeError("llama-server si e' chiuso inaspettatamente.")
             time.sleep(1)
         return False
+
+    def restart_with(self, model_path):
+        """Ferma il server corrente e lo riavvia con un altro modello."""
+        self.stop()
+        # attendi il rilascio della porta
+        for _ in range(10):
+            if not self.is_alive():
+                break
+            time.sleep(0.5)
+        self.model_path = model_path
+        self.start()
+        return self.wait_ready(timeout=180)
 
     def ask(self, user_text):
         prompt = (
@@ -155,152 +238,380 @@ class LlamaServer:
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
                 except Exception:
                     pass
+        self.proc = None
+
+
+# ============================================================
+# WIDGET: pulsante con angoli arrotondati (Canvas)
+# ============================================================
+class RoundButton(tk.Canvas):
+    """Pulsante disegnato su Canvas con angoli arrotondati."""
+
+    def __init__(self, parent, text, command, bg, fg,
+                 font, width, height, radius=22, active_bg=None,
+                 glow=None):
+        super().__init__(parent, width=width, height=height,
+                         bg=parent["bg"], highlightthickness=0, bd=0)
+        self.command = command
+        self.bg = bg
+        self.fg = fg
+        self.active_bg = active_bg or bg
+        self.glow = glow
+        self.radius = radius
+        self.w, self.h = width, height
+        self._font = font
+        self._text = text
+        self._enabled = True
+        self._draw(self.bg)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.configure(cursor="hand2")
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kw):
+        pts = [
+            x1+r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y2-r, x2, y2,
+            x2-r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y1+r, x1, y1,
+        ]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _draw(self, fill):
+        self.delete("all")
+        pad = 3
+        # alone neon morbido (se richiesto)
+        if self.glow and self._enabled:
+            for i, a in enumerate((6, 4, 2)):
+                self._round_rect(pad-a, pad-a, self.w-pad+a, self.h-pad+a,
+                                 self.radius+a, fill="", outline=self.glow,
+                                 width=1)
+        self._round_rect(pad, pad, self.w-pad, self.h-pad, self.radius,
+                         fill=fill, outline="")
+        col = self.fg if self._enabled else COL_MUTE
+        self.create_text(self.w//2, self.h//2, text=self._text,
+                         fill=col, font=self._font)
+
+    def set_text(self, text):
+        self._text = text
+        self._draw(self.bg if self._enabled else COL_LINE)
+
+    def set_enabled(self, enabled):
+        self._enabled = enabled
+        self._draw(self.bg if enabled else COL_LINE)
+
+    def _on_press(self, _):
+        if self._enabled:
+            self._draw(self.active_bg)
+
+    def _on_release(self, _):
+        if self._enabled:
+            self._draw(self.bg)
+            if self.command:
+                self.command()
 
 
 # ============================================================
 # APPLICAZIONE GUI
 # ============================================================
-class VoiceAssistantApp:
+class RaspAIApp:
     RECORD_SECONDS = 8
 
     def __init__(self, root):
         self.root = root
-        self.llama = LlamaServer()
         self.busy = False
         self.last_answer = ""
         self.rec_proc = None
         self.indicators = {}
+        self.bubbles = []           # widget delle bolle in conversazione
+        self.anim_on = False        # animazione "in attesa" attiva
+        self.anim_phase = 0
+
+        # Modelli disponibili
+        self.models = self._scan_models()
+        self.current_model = DEFAULT_MODEL
+        if not os.path.exists(self.current_model) and self.models:
+            self.current_model = self.models[0]
+        self.llama = LlamaServer(self.current_model)
+
+        self.use_piper = self._piper_available()
 
         self._build_ui()
         threading.Thread(target=self._boot_server, daemon=True).start()
         self._schedule_health_check()
+        self._tick_anim()
+
+    # ---------- SCANSIONE MODELLI ----------
+    def _scan_models(self):
+        found = sorted(glob.glob(os.path.join(MODELS_DIR, "*.gguf")))
+        return found
+
+    def _piper_path(self):
+        """Trova l'eseguibile piper: prima nel venv, poi nel PATH di sistema."""
+        venv_piper = os.path.join(BASE, "venv", "bin", "piper")
+        if os.path.exists(venv_piper):
+            return venv_piper
+        return shutil.which("piper")
+
+    def _piper_available(self):
+        return (self._piper_path() is not None
+                and os.path.exists(PIPER_MODEL))
 
     # ---------- COSTRUZIONE INTERFACCIA ----------
     def _build_ui(self):
-        self.root.title("Assistente Vocale")
+        self.root.title("RaspAI")
         self.root.configure(bg=COL_BG)
-        # Geometria esplicita 600x1024 + fullscreen come fallback
         self.root.geometry(f"{SCREEN_W}x{SCREEN_H}+0+0")
         self.root.attributes("-fullscreen", True)
         self.root.resizable(False, False)
         self.root.bind("<Escape>", lambda e: self.quit_app())
 
-        # Font compatti, adatti a 600px di larghezza
-        self.f_title  = tkfont.Font(family="DejaVu Sans", size=20, weight="normal")
+        self.f_title  = tkfont.Font(family="DejaVu Sans", size=21, weight="bold")
         self.f_sub    = tkfont.Font(family="DejaVu Sans", size=10)
-        self.f_body   = tkfont.Font(family="DejaVu Serif", size=15)
-        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=16)
+        self.f_body   = tkfont.Font(family="DejaVu Sans", size=13)
+        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=16, weight="bold")
+        self.f_mini   = tkfont.Font(family="DejaVu Sans", size=13)
         self.f_small  = tkfont.Font(family="DejaVu Sans", size=9)
         self.f_ind    = tkfont.Font(family="DejaVu Sans", size=9)
+        self.f_bub    = tkfont.Font(family="DejaVu Sans", size=12)
+        self.f_bublbl = tkfont.Font(family="DejaVu Sans", size=8, weight="bold")
 
-        PAD = 20  # padding laterale uniforme
+        PAD = 20
 
-        # === RIGA 1: barra superiore (altezza fissa) ===
+        # === RIGA 1: barra superiore ===
         topbar = tk.Frame(self.root, bg=COL_BG)
-        topbar.pack(fill="x", padx=PAD, pady=(18, 10))
+        topbar.pack(fill="x", padx=PAD, pady=(18, 8))
 
         title_wrap = tk.Frame(topbar, bg=COL_BG)
         title_wrap.pack(side="left")
-        tk.Label(title_wrap, text="oracolo", font=self.f_title,
-                 fg=COL_TEXT, bg=COL_BG).pack(anchor="w")
+        tk.Label(title_wrap, text="RaspAI", font=self.f_title,
+                 fg=COL_NEON, bg=COL_BG).pack(anchor="w")
         tk.Label(title_wrap, text="assistente vocale offline",
                  font=self.f_sub, fg=COL_MUTE, bg=COL_BG).pack(anchor="w")
 
-        self.btn_close = tk.Button(
-            topbar, text="chiudi", font=self.f_btn,
-            fg=COL_MUTE, bg=COL_BG, activebackground=COL_PANEL,
-            activeforeground=COL_ERR, relief="flat", bd=0,
-            padx=12, pady=6, cursor="hand2",
-            highlightthickness=0, command=self.quit_app,
-        )
-        self.btn_close.pack(side="right")
+        # gruppo pulsanti a destra: modello + chiudi
+        btns = tk.Frame(topbar, bg=COL_BG)
+        btns.pack(side="right")
 
-        # === RIGA 5 (in fondo): indicatori di stato servizi ===
-        # impacchettata PRIMA cosi' resta ancorata in basso
+        self.btn_model = tk.Button(
+            btns, text="\u25a4 modello", font=self.f_mini,
+            fg=COL_NEON2, bg=COL_PANEL, activebackground=COL_LINE,
+            activeforeground=COL_NEON2, relief="flat", bd=0,
+            padx=12, pady=7, cursor="hand2", highlightthickness=0,
+            command=self._open_model_menu,
+        )
+        self.btn_model.pack(side="left", padx=(0, 8))
+
+        self.btn_close = tk.Button(
+            btns, text="\u2715", font=self.f_mini,
+            fg=COL_MUTE, bg=COL_PANEL, activebackground=COL_LINE,
+            activeforeground=COL_ERR, relief="flat", bd=0,
+            padx=12, pady=7, cursor="hand2", highlightthickness=0,
+            command=self.quit_app,
+        )
+        self.btn_close.pack(side="left")
+
+        # === FONDO: indicatori di stato ===
         statusbar = tk.Frame(self.root, bg=COL_PANEL)
         statusbar.pack(fill="x", side="bottom")
         inner = tk.Frame(statusbar, bg=COL_PANEL)
-        inner.pack(pady=10)
-        for name in ("modello", "whisper", "microfono"):
+        inner.pack(pady=9)
+        voice_name = "piper" if self.use_piper else "espeak"
+        for name in ("modello", "whisper", "microfono", voice_name):
             self._make_indicator(inner, name)
 
-        # === RIGA 4: riga di stato testuale ===
+        # === riga di stato testuale ===
         self.lbl_status = tk.Label(self.root, text="avvio del modello...",
                                    font=self.f_small, fg=COL_MUTE, bg=COL_BG)
-        self.lbl_status.pack(side="bottom", pady=(4, 8))
+        self.lbl_status.pack(side="bottom", pady=(2, 6))
 
-        # === RIGA 3: pulsanti azione (altezza fissa, ancorati in basso) ===
+        # === pulsanti azione (arrotondati) ===
         bottom = tk.Frame(self.root, bg=COL_BG)
         bottom.pack(side="bottom", fill="x", padx=PAD, pady=(0, 6))
+        bw = SCREEN_W - 2 * PAD
 
-        self.btn_talk = tk.Button(
-            bottom, text="parla", font=self.f_btn,
-            fg=COL_BG, bg=COL_ACCENT, activebackground="#bcd0b4",
-            activeforeground=COL_BG, relief="flat", bd=0,
-            pady=20, cursor="hand2", highlightthickness=0,
-            command=self.on_talk,
-        )
-        self.btn_talk.pack(fill="x", pady=(0, 8))
+        self.btn_talk = RoundButton(
+            bottom, text="\U0001f3a4   parla", command=self.on_talk,
+            bg=COL_NEON, fg=COL_BG, active_bg="#4ff5e8",
+            font=self.f_btn, width=bw, height=66, radius=26,
+            glow=COL_NEON)
+        self.btn_talk.pack(pady=(0, 8))
 
-        self.btn_listen = tk.Button(
-            bottom, text="ascolta", font=self.f_btn,
-            fg=COL_TEXT, bg=COL_PANEL, activebackground=COL_LINE,
-            activeforeground=COL_TEXT, relief="flat", bd=0,
-            pady=20, cursor="hand2", highlightthickness=0,
-            state="disabled", command=self.on_listen,
-        )
-        self.btn_listen.pack(fill="x")
+        self.btn_listen = RoundButton(
+            bottom, text="\U0001f50a   ascolta", command=self.on_listen,
+            bg=COL_PANEL, fg=COL_TEXT, active_bg=COL_LINE,
+            font=self.f_btn, width=bw, height=66, radius=26)
+        self.btn_listen.set_enabled(False)
+        self.btn_listen.pack()
 
-        # === RIGA 2: card della risposta (riempie lo spazio rimanente) ===
-        # impacchettata PER ULTIMA con expand: prende solo cio' che avanza
+        # === centro: conversazione a bolle (scrollabile) ===
         center = tk.Frame(self.root, bg=COL_BG)
-        center.pack(fill="both", expand=True, padx=PAD, pady=(0, 12))
+        center.pack(fill="both", expand=True, padx=PAD, pady=(2, 10))
 
-        card = tk.Frame(center, bg=COL_CARD, highlightthickness=1,
-                        highlightbackground=COL_LINE)
-        card.pack(fill="both", expand=True)
+        self.chat_canvas = tk.Canvas(center, bg=COL_BG, highlightthickness=0,
+                                     bd=0)
+        chat_scroll = tk.Scrollbar(center, command=self.chat_canvas.yview,
+                                   troughcolor=COL_BG, bd=0,
+                                   highlightthickness=0)
+        self.chat_canvas.configure(yscrollcommand=chat_scroll.set)
+        chat_scroll.pack(side="right", fill="y")
+        self.chat_canvas.pack(side="left", fill="both", expand=True)
 
-        cap = tk.Frame(card, bg=COL_CARD)
-        cap.pack(fill="x", padx=18, pady=(16, 4))
-        tk.Label(cap, text="risposta", font=self.f_small,
-                 fg=COL_ACCENT, bg=COL_CARD).pack(side="left")
+        # frame interno che contiene le bolle
+        self.chat_frame = tk.Frame(self.chat_canvas, bg=COL_BG)
+        self.chat_window = self.chat_canvas.create_window(
+            (0, 0), window=self.chat_frame, anchor="nw")
+        self.chat_frame.bind(
+            "<Configure>",
+            lambda e: self.chat_canvas.configure(
+                scrollregion=self.chat_canvas.bbox("all")))
+        self.chat_canvas.bind(
+            "<Configure>",
+            lambda e: self.chat_canvas.itemconfig(
+                self.chat_window, width=e.width))
 
-        # "hai detto" su riga propria: a 600px non sta accanto al titolo
-        self.lbl_heard = tk.Label(card, text="", font=self.f_small,
-                                  fg=COL_MUTE, bg=COL_CARD, anchor="w",
-                                  wraplength=SCREEN_W - 2 * PAD - 36,
-                                  justify="left")
-        self.lbl_heard.pack(fill="x", padx=18, pady=(0, 2))
-
-        txt_wrap = tk.Frame(card, bg=COL_CARD)
-        txt_wrap.pack(fill="both", expand=True, padx=18, pady=(4, 18))
-
-        scroll = tk.Scrollbar(txt_wrap, troughcolor=COL_CARD, bd=0,
-                              highlightthickness=0)
-        scroll.pack(side="right", fill="y")
-
-        self.txt = tk.Text(
-            txt_wrap, font=self.f_body, fg=COL_TEXT, bg=COL_CARD,
-            wrap="word", relief="flat", bd=0, padx=2, pady=4,
-            insertbackground=COL_TEXT, yscrollcommand=scroll.set,
-            highlightthickness=0, spacing3=5,
-        )
-        self.txt.pack(side="left", fill="both", expand=True)
-        scroll.config(command=self.txt.yview)
-        self._set_text("Premi  parla  e fai la tua domanda.", muted=True)
-        self.txt.config(state="disabled")
+        self.chat_width = SCREEN_W - 2 * PAD - 16
+        self._add_system_line("Premi  parla  e fai la tua domanda.")
 
     def _make_indicator(self, parent, name):
-        """Crea un indicatore: pallino + etichetta."""
         cell = tk.Frame(parent, bg=COL_PANEL)
-        cell.pack(side="left", padx=14)
+        cell.pack(side="left", padx=10)
         dot = tk.Label(cell, text="\u25cf", font=self.f_ind,
                        fg=COL_DIM, bg=COL_PANEL)
-        dot.pack(side="left", padx=(0, 6))
+        dot.pack(side="left", padx=(0, 5))
         lbl = tk.Label(cell, text=name, font=self.f_ind,
                        fg=COL_MUTE, bg=COL_PANEL)
         lbl.pack(side="left")
         self.indicators[name] = dot
+
+    # ---------- BOLLE DI CONVERSAZIONE ----------
+    def _add_system_line(self, text):
+        """Riga di testo discreta, centrata (non e' una bolla)."""
+        lbl = tk.Label(self.chat_frame, text=text, font=self.f_small,
+                       fg=COL_MUTE, bg=COL_BG, wraplength=self.chat_width,
+                       justify="center")
+        lbl.pack(pady=18)
+        self.bubbles.append(lbl)
+        self._scroll_to_end()
+
+    def _add_bubble(self, who, text):
+        """Aggiunge una bolla chat. who = 'user' oppure 'ai'.
+        Restituisce il frame della bolla (per poterlo aggiornare)."""
+        is_user = (who == "user")
+        outer = tk.Frame(self.chat_frame, bg=COL_BG)
+        outer.pack(fill="x", pady=6)
+
+        bub_bg  = COL_USER_BUB if is_user else COL_AI_BUB
+        accent  = COL_NEON2 if is_user else COL_NEON
+        label   = "TU" if is_user else "RASPAI"
+
+        # Canvas per disegnare la bolla arrotondata
+        maxw = int(self.chat_width * 0.82)
+        wrap = maxw - 28
+        # misura l'altezza necessaria al testo
+        meas = tk.Label(self.root, text=text, font=self.f_bub,
+                        wraplength=wrap, justify="left")
+        meas.update_idletasks()
+        txt_h = meas.winfo_reqheight()
+        txt_w = min(meas.winfo_reqwidth(), wrap)
+        meas.destroy()
+
+        bub_w = txt_w + 28
+        bub_h = txt_h + 40
+        cv = tk.Canvas(outer, width=bub_w, height=bub_h, bg=COL_BG,
+                       highlightthickness=0, bd=0)
+        cv.pack(side="right" if is_user else "left",
+                padx=(0, 2) if is_user else (2, 0))
+
+        r = 18
+        pts = [
+            r, 0, bub_w-r, 0, bub_w, 0, bub_w, r, bub_w, bub_h-r,
+            bub_w, bub_h, bub_w-r, bub_h, r, bub_h, 0, bub_h,
+            0, bub_h-r, 0, r, 0, 0,
+        ]
+        cv.create_polygon(pts, smooth=True, fill=bub_bg, outline=accent,
+                          width=1)
+        cv.create_text(14, 13, text=label, anchor="w", fill=accent,
+                       font=self.f_bublbl)
+        cv.create_text(14, 26, text=text, anchor="nw", fill=COL_TEXT,
+                       font=self.f_bub, width=wrap)
+
+        self.bubbles.append(outer)
+        self._scroll_to_end()
+        return cv
+
+    def _add_thinking_bubble(self):
+        """Bolla AI animata mentre il modello pensa. Restituisce il canvas."""
+        outer = tk.Frame(self.chat_frame, bg=COL_BG)
+        outer.pack(fill="x", pady=6)
+        cv = tk.Canvas(outer, width=120, height=52, bg=COL_BG,
+                       highlightthickness=0, bd=0)
+        cv.pack(side="left", padx=(2, 0))
+        r = 18
+        w, h = 120, 52
+        pts = [r,0, w-r,0, w,0, w,r, w,h-r, w,h, w-r,h, r,h, 0,h, 0,h-r, 0,r, 0,0]
+        cv.create_polygon(pts, smooth=True, fill=COL_AI_BUB,
+                          outline=COL_NEON, width=1)
+        cv.create_text(14, 13, text="RASPAI", anchor="w", fill=COL_NEON,
+                       font=self.f_bublbl)
+        # tre puntini animati
+        self._think_dots = []
+        for i in range(3):
+            d = cv.create_oval(34+i*22, 30, 46+i*22, 42,
+                               fill=COL_NEON, outline="")
+            self._think_dots.append(d)
+        self._think_canvas = cv
+        self.bubbles.append(outer)
+        self._scroll_to_end()
+        return cv
+
+    def _scroll_to_end(self):
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
+        self.chat_canvas.yview_moveto(1.0)
+
+    # ---------- ANIMAZIONE NEON DI ATTESA ----------
+    def _tick_anim(self):
+        """Loop di animazione (gira sempre, agisce solo se anim_on)."""
+        if self.anim_on:
+            self.anim_phase += 1
+            # pulsazione dei tre puntini "thinking"
+            if getattr(self, "_think_canvas", None) is not None:
+                cv = self._think_canvas
+                for i, d in enumerate(self._think_dots):
+                    # onda sinusoidale sfasata per ogni puntino
+                    s = math.sin((self.anim_phase / 3.0) - i * 0.9)
+                    bright = (s + 1) / 2  # 0..1
+                    col = self._mix(COL_AI_BUB, COL_NEON, 0.25 + 0.75*bright)
+                    try:
+                        cv.itemconfig(d, fill=col)
+                    except tk.TclError:
+                        pass
+            # bordo neon pulsante del pulsante parla
+            glow = self._mix(COL_NEON, COL_NEON_PK,
+                             (math.sin(self.anim_phase/4.0)+1)/2)
+            self.btn_talk.glow = glow
+            self.btn_talk._draw(self.btn_talk.bg
+                                if self.btn_talk._enabled else COL_LINE)
+        self.root.after(90, self._tick_anim)
+
+    @staticmethod
+    def _mix(hex1, hex2, t):
+        """Interpola due colori esadecimali. t in [0,1]."""
+        t = max(0.0, min(1.0, t))
+        c1 = tuple(int(hex1[i:i+2], 16) for i in (1, 3, 5))
+        c2 = tuple(int(hex2[i:i+2], 16) for i in (1, 3, 5))
+        m = tuple(int(a + (b-a)*t) for a, b in zip(c1, c2))
+        return f"#{m[0]:02x}{m[1]:02x}{m[2]:02x}"
+
+    def _start_thinking_anim(self):
+        self.anim_on = True
+        self.anim_phase = 0
+
+    def _stop_thinking_anim(self):
+        self.anim_on = False
+        self.btn_talk.glow = COL_NEON
+        self._think_canvas = None
+        # ripristina il pulsante
+        self.root.after(0, lambda: self.btn_talk._draw(
+            self.btn_talk.bg if self.btn_talk._enabled else COL_LINE))
 
     # ---------- HELPER INTERFACCIA ----------
     def _set_indicator(self, name, color):
@@ -308,19 +619,83 @@ class VoiceAssistantApp:
         if dot is not None:
             self.root.after(0, lambda: dot.config(fg=color))
 
-    def _set_text(self, content, muted=False):
-        self.txt.config(state="normal")
-        self.txt.delete("1.0", "end")
-        self.txt.insert("1.0", content)
-        self.txt.tag_configure("all", foreground=COL_MUTE if muted else COL_TEXT)
-        self.txt.tag_add("all", "1.0", "end")
-        self.txt.config(state="disabled")
-
     def _status(self, text, color=COL_MUTE):
         self.root.after(0, lambda: self.lbl_status.config(text=text, fg=color))
 
     def _ui(self, fn):
         self.root.after(0, fn)
+
+    # ---------- MENU SELEZIONE MODELLO ----------
+    def _open_model_menu(self):
+        """Mostra un menu a comparsa con i modelli disponibili."""
+        self.models = self._scan_models()
+        menu = tk.Menu(self.root, tearoff=0, bg=COL_PANEL, fg=COL_TEXT,
+                       activebackground=COL_NEON2, activeforeground=COL_BG,
+                       bd=0, font=self.f_mini)
+        if not self.models:
+            menu.add_command(label="(nessun modello in models/)",
+                             state="disabled")
+        else:
+            for path in self.models:
+                label = pretty_model_name(path)
+                mark = "  \u2714" if path == self.current_model else ""
+                menu.add_command(
+                    label=label + mark,
+                    command=lambda p=path: self._select_model(p))
+        # posiziona il menu sotto il pulsante
+        x = self.btn_model.winfo_rootx()
+        y = self.btn_model.winfo_rooty() + self.btn_model.winfo_height() + 4
+        menu.tk_popup(x, y)
+
+    def _select_model(self, path):
+        if path == self.current_model:
+            return
+        if self.busy:
+            self._status("attendi: operazione in corso", COL_WARN)
+            return
+        self.current_model = path
+        name = pretty_model_name(path)
+        self._add_system_line(f"cambio modello: {name}")
+        self.busy = True
+        self.btn_talk.set_enabled(False)
+        threading.Thread(target=self._do_switch_model,
+                         args=(path, name), daemon=True).start()
+
+    def _do_switch_model(self, path, name):
+        self._set_indicator("modello", COL_WARN)
+        self._status(f"avvio modello {name}...", COL_NEON2)
+        try:
+            ok = self.llama.restart_with(path)
+            if ok:
+                self._set_indicator("modello", COL_OK)
+                self._status(f"modello pronto: {name}", COL_OK)
+            else:
+                self._set_indicator("modello", COL_ERR)
+                self._status("timeout avvio modello", COL_ERR)
+        except Exception as e:
+            self._set_indicator("modello", COL_ERR)
+            self._status(f"errore: {e}", COL_ERR)
+        finally:
+            self.busy = False
+            self._ui(lambda: self.btn_talk.set_enabled(True))
+
+    # ---------- AVVIO SERVER ----------
+    def _boot_server(self):
+        self._set_indicator("modello", COL_WARN)
+        try:
+            self.llama.start()
+            if self.llama.wait_ready(timeout=180):
+                self._set_indicator("modello", COL_OK)
+                name = pretty_model_name(self.current_model)
+                self._status(f"modello pronto: {name}", COL_OK)
+            else:
+                self._set_indicator("modello", COL_ERR)
+                self._status("timeout avvio modello", COL_ERR)
+        except Exception as e:
+            self._set_indicator("modello", COL_ERR)
+            self._status("errore avvio modello", COL_ERR)
+            self._ui(lambda: self._add_system_line(
+                f"Impossibile avviare il modello: {e}"))
 
     # ---------- CONTROLLO STATO SERVIZI ----------
     def _schedule_health_check(self):
@@ -332,6 +707,13 @@ class VoiceAssistantApp:
         whisper_ok = os.path.exists(WHISPER) and os.path.exists(WHISPER_MODEL)
         self._set_indicator("whisper", COL_OK if whisper_ok else COL_ERR)
         self._set_indicator("microfono", COL_OK if self._mic_available() else COL_ERR)
+        # voce
+        voice_name = "piper" if self.use_piper else "espeak"
+        if self.use_piper:
+            self._set_indicator("piper", COL_OK)
+        else:
+            ok = shutil.which("espeak-ng") is not None
+            self._set_indicator("espeak", COL_OK if ok else COL_ERR)
 
     def _mic_available(self):
         if shutil.which("arecord") is None:
@@ -342,25 +724,6 @@ class VoiceAssistantApp:
             return "card" in out.stdout
         except Exception:
             return False
-
-    # ---------- AVVIO SERVER ----------
-    def _boot_server(self):
-        self._set_indicator("modello", COL_WARN)
-        try:
-            self.llama.start()
-            if self.llama.wait_ready(timeout=180):
-                self._set_indicator("modello", COL_OK)
-                self._status("modello pronto", COL_OK)
-                self._ui(lambda: self._set_text(
-                    "Premi  parla  e fai la tua domanda.", muted=True))
-            else:
-                self._set_indicator("modello", COL_ERR)
-                self._status("timeout avvio modello", COL_ERR)
-        except Exception as e:
-            self._set_indicator("modello", COL_ERR)
-            self._status("errore avvio modello", COL_ERR)
-            self._ui(lambda: self._set_text(
-                f"Impossibile avviare il modello:\n\n{e}"))
 
     # ---------- FLUSSO: PARLA ----------
     def on_talk(self):
@@ -374,45 +737,68 @@ class VoiceAssistantApp:
         threading.Thread(target=self._talk_pipeline, daemon=True).start()
 
     def _set_busy_ui(self, busy):
-        state = "disabled" if busy else "normal"
-        self._ui(lambda: self.btn_talk.config(
-            state=state, text="in ascolto..." if busy else "parla"))
+        self._ui(lambda: self.btn_talk.set_enabled(not busy))
+        self._ui(lambda: self.btn_talk.set_text(
+            "\U0001f3a4   in ascolto..." if busy else "\U0001f3a4   parla"))
         if busy:
-            self._ui(lambda: self.btn_listen.config(state="disabled"))
+            self._ui(lambda: self.btn_listen.set_enabled(False))
 
     def _talk_pipeline(self):
+        thinking_cv = None
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 wav = os.path.join(tmp, "input.wav")
 
+                # 1) REGISTRAZIONE
                 self._status(f"registrazione ({self.RECORD_SECONDS}s)... parla ora",
-                             COL_ACCENT2)
+                             COL_NEON_PK)
                 self._record_audio(wav)
 
-                self._status("trascrizione in corso...", COL_ACCENT)
+                # 2) TRASCRIZIONE
+                self._status("trascrizione in corso...", COL_NEON)
                 question = self._transcribe(wav)
                 if not question:
                     self._status("non ho capito nulla, riprova", COL_ERR)
-                    self._ui(lambda: self._set_text(
-                        "Non ho rilevato parole. Riprova premendo  parla.",
-                        muted=True))
+                    self._ui(lambda: self._add_system_line(
+                        "Non ho rilevato parole. Riprova premendo  parla."))
                     return
-                self._ui(lambda: self.lbl_heard.config(
-                    text=f"hai detto: \u201c{question}\u201d"))
 
-                self._status("il modello sta pensando...", COL_ACCENT)
+                # bolla utente
+                self._ui(lambda: self._add_bubble("user", question))
+
+                # 3) MODELLO  -- bolla animata di attesa
+                self._status("RaspAI sta pensando...", COL_NEON)
+                holder = {}
+                def make_think():
+                    holder["cv"] = self._add_thinking_bubble()
+                self._ui(make_think)
+                time.sleep(0.05)  # lascia creare il widget
+                self._start_thinking_anim()
+
                 answer = self.llama.ask(question)
                 if not answer:
-                    answer = "(Il modello non ha prodotto una risposta.)"
+                    answer = "(Nessuna risposta dal modello.)"
                 self.last_answer = answer
-                self._ui(lambda: self._set_text(answer))
-                self._ui(lambda: self.btn_listen.config(state="normal"))
+
+                # rimuovi la bolla "thinking" e metti la risposta
+                self._stop_thinking_anim()
+                def swap():
+                    cv = holder.get("cv")
+                    if cv is not None:
+                        parent = cv.master
+                        parent.destroy()
+                        if parent in self.bubbles:
+                            self.bubbles.remove(parent)
+                    self._add_bubble("ai", answer)
+                self._ui(swap)
+
+                self._ui(lambda: self.btn_listen.set_enabled(True))
                 self._status("pronto", COL_OK)
         except Exception as e:
+            self._stop_thinking_anim()
             self._status("errore", COL_ERR)
             msg = str(e)
-            self._ui(lambda: self._set_text(
-                f"Si e' verificato un errore:\n\n{msg}"))
+            self._ui(lambda: self._add_system_line(f"Errore: {msg}"))
         finally:
             self.busy = False
             self._set_busy_ui(False)
@@ -429,8 +815,7 @@ class VoiceAssistantApp:
         self.rec_proc = None
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
             raise RuntimeError(
-                "Registrazione fallita. Controlla il microfono e ARECORD_DEVICE "
-                "(usa `arecord -l`).")
+                "Registrazione fallita. Controlla il microfono e ARECORD_DEVICE.")
 
     def _transcribe(self, wav_path):
         if not os.path.exists(WHISPER):
@@ -452,24 +837,45 @@ class VoiceAssistantApp:
     def on_listen(self):
         if not self.last_answer:
             return
-        self._ui(lambda: self.btn_listen.config(
-            state="disabled", text="lettura..."))
+        self._ui(lambda: self.btn_listen.set_enabled(False))
+        self._ui(lambda: self.btn_listen.set_text("\U0001f50a   lettura..."))
         threading.Thread(target=self._speak, daemon=True).start()
 
     def _speak(self):
+        """Legge la risposta. Usa Piper se disponibile, altrimenti espeak-ng."""
         try:
-            subprocess.run(
-                ["espeak-ng", "-v", TTS_VOICE, "-s", str(TTS_SPEED),
-                 self.last_answer],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=120)
+            if self.use_piper:
+                self._speak_piper(self.last_answer)
+            else:
+                self._speak_espeak(self.last_answer)
         except FileNotFoundError:
-            self._status("espeak-ng non installato", COL_ERR)
+            self._status("motore voce non trovato", COL_ERR)
         except Exception as e:
-            self._status(f"errore tts: {e}", COL_ERR)
+            self._status(f"errore voce: {e}", COL_ERR)
         finally:
-            self._ui(lambda: self.btn_listen.config(
-                state="normal", text="ascolta"))
+            self._ui(lambda: self.btn_listen.set_enabled(True))
+            self._ui(lambda: self.btn_listen.set_text("\U0001f50a   ascolta"))
+
+    def _speak_piper(self, text):
+        """Piper genera un wav, poi lo riproduce con aplay."""
+        piper_bin = self._piper_path() or "piper"
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = os.path.join(tmp, "out.wav")
+            piper = subprocess.Popen(
+                [piper_bin, "--model", PIPER_MODEL, "--output_file", wav],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            piper.communicate(input=text.encode("utf-8"), timeout=120)
+            if os.path.exists(wav):
+                subprocess.run(["aplay", "-q", wav],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=120)
+
+    def _speak_espeak(self, text):
+        subprocess.run(
+            ["espeak-ng", "-v", TTS_VOICE, "-s", str(TTS_SPEED), text],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=120)
 
     # ---------- USCITA ----------
     def quit_app(self):
@@ -491,7 +897,7 @@ class VoiceAssistantApp:
 # ============================================================
 def main():
     root = tk.Tk()
-    app = VoiceAssistantApp(root)
+    app = RaspAIApp(root)
     signal.signal(signal.SIGINT,  lambda s, f: app.quit_app())
     signal.signal(signal.SIGTERM, lambda s, f: app.quit_app())
     root.protocol("WM_DELETE_WINDOW", app.quit_app)
