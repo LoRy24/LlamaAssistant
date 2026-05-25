@@ -4,7 +4,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
 PY="$REPO/venv/bin/python3"
-APP="$REPO/voice_assistant.py"
+APP="$REPO/main.py"
 
 # --- Controlli minimi ---
 if [ ! -x "$PY" ]; then
@@ -14,7 +14,7 @@ if [ ! -x "$PY" ]; then
 fi
 
 if [ ! -f "$APP" ]; then
-    echo "ERRORE: voice_assistant.py non trovato in $REPO"
+    echo "ERRORE: main.py non trovato in $REPO"
     exit 1
 fi
 
