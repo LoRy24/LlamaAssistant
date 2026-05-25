@@ -1,0 +1,27 @@
+# --- Motori compilati (clonati e buildati da setup.sh) ---
+llama.cpp/
+whisper.cpp/
+
+# --- Ambiente virtuale Python ---
+venv/
+
+# --- Modelli AI .gguf (scaricati da setup.sh, ~1 GB l'uno) ---
+models/
+*.gguf
+
+# --- Voce Piper (scaricata da setup.sh) ---
+piper/
+*.onnx
+*.onnx.json
+
+# --- File audio temporanei ---
+*.wav
+
+# --- Cache e file compilati Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- File di sistema ---
+.DS_Store
+Thumbs.db
