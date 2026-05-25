@@ -1,0 +1,8 @@
+# Pacchetti Python per RaspAI (installati nel venv da setup.sh)
+#
+# NOTA: tkinter NON va qui - e' il pacchetto di sistema python3-tk,
+# installato via apt da setup.sh. Tutto il resto usato dallo script
+# (os, json, threading, urllib, ...) fa parte della libreria standard.
+
+# Motore di sintesi vocale "umana", offline
+piper-tts
