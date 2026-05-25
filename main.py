@@ -7,12 +7,11 @@ Parla con un modello AI (Qwen 1.5B) gestito da llama.cpp.
 
 Catena: microfono -> whisper.cpp (speech-to-text) -> llama-server (AI) -> espeak-ng (text-to-speech)
 
-Dipendenze di sistema (installabili con apt):
+Dipendenze di sistema:
     sudo apt install espeak-ng alsa-utils python3-tk
-    (arecord fa parte di alsa-utils, gia' presente su Raspberry Pi OS)
 
-llama-server deve essere compilato insieme a llama.cpp:
-    si trova di solito in llama.cpp/build/bin/llama-server
+llama-server deve essere compilato insieme a llama.cpp
+(di solito in llama.cpp/build/bin/llama-server).
 """
 
 import os
@@ -23,6 +22,7 @@ import signal
 import threading
 import subprocess
 import tempfile
+import shutil
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -38,38 +38,37 @@ WHISPER_MODEL = f"{BASE}/whisper.cpp/models/ggml-base.bin"
 LLAMA_SERVER  = f"{BASE}/llama.cpp/build/bin/llama-server"
 LLAMA_MODEL   = f"{BASE}/llama.cpp/models/qwen1.5b.gguf"
 
-# Server llama.cpp
 LLAMA_HOST    = "127.0.0.1"
 LLAMA_PORT    = 8080
-LLAMA_THREADS = 4          # core del Raspberry da usare
-LLAMA_CTX     = 2048       # dimensione del contesto
+LLAMA_THREADS = 4
+LLAMA_CTX     = 2048
 
-# Audio
-ARECORD_DEVICE = "default" # "default" oppure es. "plughw:1,0" -- vedi `arecord -l`
-WHISPER_LANG   = "it"      # lingua del parlato ("it", "en", "auto", ...)
+ARECORD_DEVICE = "default"   # "default" oppure es. "plughw:1,0" -- vedi `arecord -l`
+WHISPER_LANG   = "it"
 
-# Text-to-speech (espeak-ng)
-TTS_VOICE = "it"           # voce espeak-ng
-TTS_SPEED = 160            # parole al minuto
+TTS_VOICE = "it"
+TTS_SPEED = 160
 
-# Prompt di sistema dato al modello
 SYSTEM_PROMPT = (
     "Sei un assistente vocale gentile e conciso. "
     "Rispondi in italiano in modo chiaro e breve, adatto alla lettura ad alta voce."
 )
 
 # ============================================================
-# PALETTE / TEMA GRAFICO
+# PALETTE  -  tema scuro caldo (carbone/talpa, accento salvia)
 # ============================================================
-COL_BG      = "#0d1117"   # sfondo principale (blu notte)
-COL_PANEL   = "#161b22"   # pannelli
-COL_CARD    = "#1c2330"   # card della risposta
-COL_ACCENT  = "#5eead4"   # accento (verde acqua)
-COL_ACCENT2 = "#f472b6"   # accento secondario (rosa)
-COL_TEXT    = "#e6edf3"   # testo principale
-COL_MUTE    = "#7d8590"   # testo secondario
-COL_DANGER  = "#f85149"   # rosso (chiudi / errori)
-COL_OK      = "#3fb950"   # verde (ok)
+COL_BG      = "#21201d"   # carbone caldo
+COL_PANEL   = "#2b2a26"   # pannelli
+COL_CARD    = "#302e2a"   # card della risposta
+COL_LINE    = "#3d3a35"   # bordi sottili
+COL_ACCENT  = "#a8c0a0"   # salvia tenue
+COL_ACCENT2 = "#d8a48f"   # terracotta soft
+COL_TEXT    = "#ece8e1"   # testo principale (avorio)
+COL_MUTE    = "#938d82"   # testo secondario
+COL_DIM     = "#5f5b53"   # indicatore spento
+COL_OK      = "#8bb48a"   # verde soft
+COL_WARN    = "#d8a48f"   # ambra/terracotta
+COL_ERR     = "#c98a82"   # rosso soft (non aggressivo)
 
 
 # ============================================================
@@ -84,7 +83,6 @@ class LlamaServer:
         self.url_health     = f"http://{LLAMA_HOST}:{LLAMA_PORT}/health"
 
     def is_alive(self):
-        """True se il server risponde all'endpoint /health."""
         try:
             with urllib.request.urlopen(self.url_health, timeout=2) as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -93,18 +91,13 @@ class LlamaServer:
             return False
 
     def start(self):
-        """Avvia il server se non e' gia' attivo."""
         if self.is_alive():
-            return  # qualcuno l'ha gia' avviato, lo riusiamo
-
+            return
         if not os.path.exists(LLAMA_SERVER):
             raise FileNotFoundError(
-                f"llama-server non trovato in:\n{LLAMA_SERVER}\n"
-                "Compila llama.cpp con il target server."
-            )
+                f"llama-server non trovato in:\n{LLAMA_SERVER}")
         if not os.path.exists(LLAMA_MODEL):
             raise FileNotFoundError(f"Modello non trovato:\n{LLAMA_MODEL}")
-
         cmd = [
             LLAMA_SERVER,
             "-m", LLAMA_MODEL,
@@ -113,16 +106,11 @@ class LlamaServer:
             "-t", str(LLAMA_THREADS),
             "-c", str(LLAMA_CTX),
         ]
-        # Avvia in un nuovo process group: cosi' lo possiamo chiudere insieme ai figli
         self.proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,
-        )
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid)
 
-    def wait_ready(self, timeout=120):
-        """Attende che il server sia pronto a rispondere."""
+    def wait_ready(self, timeout=180):
         start = time.time()
         while time.time() - start < timeout:
             if self.is_alive():
@@ -133,7 +121,6 @@ class LlamaServer:
         return False
 
     def ask(self, user_text):
-        """Invia un prompt al modello e restituisce la risposta come stringa."""
         prompt = (
             f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{user_text}<|im_end|>\n"
@@ -146,18 +133,14 @@ class LlamaServer:
             "top_p": 0.9,
             "stop": ["<|im_end|>", "<|im_start|>"],
         }).encode("utf-8")
-
         req = urllib.request.Request(
-            self.url_completion,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
+            self.url_completion, data=payload,
+            headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as r:
             data = json.loads(r.read().decode("utf-8"))
         return data.get("content", "").strip()
 
     def stop(self):
-        """Termina il server e tutti i suoi processi figli."""
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
@@ -173,7 +156,7 @@ class LlamaServer:
 # APPLICAZIONE GUI
 # ============================================================
 class VoiceAssistantApp:
-    RECORD_SECONDS = 8  # durata massima registrazione
+    RECORD_SECONDS = 8
 
     def __init__(self, root):
         self.root = root
@@ -181,121 +164,136 @@ class VoiceAssistantApp:
         self.busy = False
         self.last_answer = ""
         self.rec_proc = None
+        self.indicators = {}   # nome -> pallino
 
         self._build_ui()
-        # Avvia il server in un thread separato per non bloccare la finestra
         threading.Thread(target=self._boot_server, daemon=True).start()
+        self._schedule_health_check()
 
     # ---------- COSTRUZIONE INTERFACCIA ----------
     def _build_ui(self):
         self.root.title("Assistente Vocale")
         self.root.configure(bg=COL_BG)
         self.root.attributes("-fullscreen", True)
-        # ESC come scorciatoia d'emergenza per uscire
         self.root.bind("<Escape>", lambda e: self.quit_app())
 
-        # --- Font ---
-        self.f_title  = tkfont.Font(family="DejaVu Sans", size=30, weight="bold")
-        self.f_sub    = tkfont.Font(family="DejaVu Sans", size=12)
+        self.f_title  = tkfont.Font(family="DejaVu Sans", size=26, weight="normal")
+        self.f_sub    = tkfont.Font(family="DejaVu Sans", size=11)
         self.f_body   = tkfont.Font(family="DejaVu Serif", size=17)
-        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=18, weight="bold")
-        self.f_small  = tkfont.Font(family="DejaVu Sans", size=11)
-        self.f_status = tkfont.Font(family="DejaVu Sans Mono", size=11)
+        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=17)
+        self.f_small  = tkfont.Font(family="DejaVu Sans", size=10)
+        self.f_ind    = tkfont.Font(family="DejaVu Sans", size=10)
 
-        # --- Barra superiore ---
+        # --- Barra superiore (minimale) ---
         topbar = tk.Frame(self.root, bg=COL_BG)
-        topbar.pack(fill="x", padx=36, pady=(28, 8))
+        topbar.pack(fill="x", padx=48, pady=(34, 18))
 
         title_wrap = tk.Frame(topbar, bg=COL_BG)
         title_wrap.pack(side="left")
-        tk.Label(title_wrap, text="◈  ORACOLO", font=self.f_title,
+        tk.Label(title_wrap, text="oracolo", font=self.f_title,
                  fg=COL_TEXT, bg=COL_BG).pack(anchor="w")
-        tk.Label(title_wrap, text="assistente vocale offline · qwen 1.5b",
+        tk.Label(title_wrap, text="assistente vocale offline",
                  font=self.f_sub, fg=COL_MUTE, bg=COL_BG).pack(anchor="w")
 
-        # Pulsante CHIUDI (task-kill)
         self.btn_close = tk.Button(
-            topbar, text="✕  CHIUDI", font=self.f_btn,
-            fg="#ffffff", bg=COL_DANGER, activebackground="#ff6b63",
-            activeforeground="#ffffff", relief="flat", bd=0,
-            padx=22, pady=10, cursor="hand2",
-            command=self.quit_app,
+            topbar, text="chiudi", font=self.f_btn,
+            fg=COL_MUTE, bg=COL_BG, activebackground=COL_PANEL,
+            activeforeground=COL_ERR, relief="flat", bd=0,
+            padx=16, pady=8, cursor="hand2",
+            highlightthickness=0, command=self.quit_app,
         )
         self.btn_close.pack(side="right")
 
-        # Linea accento sotto la barra
-        tk.Frame(self.root, bg=COL_ACCENT, height=2).pack(fill="x", padx=36)
-
         # --- Area centrale: la risposta ---
         center = tk.Frame(self.root, bg=COL_BG)
-        center.pack(fill="both", expand=True, padx=36, pady=24)
+        center.pack(fill="both", expand=True, padx=48, pady=(0, 22))
 
         card = tk.Frame(center, bg=COL_CARD, highlightthickness=1,
-                        highlightbackground="#2a3340")
+                        highlightbackground=COL_LINE)
         card.pack(fill="both", expand=True)
 
         cap = tk.Frame(card, bg=COL_CARD)
-        cap.pack(fill="x", padx=26, pady=(20, 6))
-        tk.Label(cap, text="RISPOSTA", font=self.f_small,
+        cap.pack(fill="x", padx=30, pady=(24, 4))
+        tk.Label(cap, text="risposta", font=self.f_small,
                  fg=COL_ACCENT, bg=COL_CARD).pack(side="left")
         self.lbl_heard = tk.Label(cap, text="", font=self.f_small,
                                   fg=COL_MUTE, bg=COL_CARD)
         self.lbl_heard.pack(side="right")
 
-        # Casella di testo con scrollbar per la risposta
         txt_wrap = tk.Frame(card, bg=COL_CARD)
-        txt_wrap.pack(fill="both", expand=True, padx=26, pady=(0, 20))
+        txt_wrap.pack(fill="both", expand=True, padx=30, pady=(0, 26))
 
-        scroll = tk.Scrollbar(txt_wrap)
+        scroll = tk.Scrollbar(txt_wrap, troughcolor=COL_CARD, bd=0,
+                              highlightthickness=0)
         scroll.pack(side="right", fill="y")
 
         self.txt = tk.Text(
             txt_wrap, font=self.f_body, fg=COL_TEXT, bg=COL_CARD,
-            wrap="word", relief="flat", bd=0, padx=4, pady=4,
+            wrap="word", relief="flat", bd=0, padx=2, pady=6,
             insertbackground=COL_TEXT, yscrollcommand=scroll.set,
-            highlightthickness=0,
+            highlightthickness=0, spacing3=6,
         )
         self.txt.pack(side="left", fill="both", expand=True)
         scroll.config(command=self.txt.yview)
-        self._set_text("Premi  «PARLA»  e fai la tua domanda.\n\n"
-                       "Avvio del modello in corso...", muted=True)
+        self._set_text("Premi  parla  e fai la tua domanda.", muted=True)
         self.txt.config(state="disabled")
 
-        # --- Barra inferiore: pulsanti azione ---
+        # --- Pulsanti azione ---
         bottom = tk.Frame(self.root, bg=COL_BG)
-        bottom.pack(fill="x", padx=36, pady=(0, 22))
+        bottom.pack(fill="x", padx=48, pady=(0, 20))
 
         self.btn_talk = tk.Button(
-            bottom, text="🎙   PARLA", font=self.f_btn,
-            fg=COL_BG, bg=COL_ACCENT, activebackground="#7ff0dd",
+            bottom, text="parla", font=self.f_btn,
+            fg=COL_BG, bg=COL_ACCENT, activebackground="#bcd0b4",
             activeforeground=COL_BG, relief="flat", bd=0,
-            padx=40, pady=20, cursor="hand2",
+            padx=40, pady=18, cursor="hand2", highlightthickness=0,
             command=self.on_talk,
         )
-        self.btn_talk.pack(side="left", expand=True, fill="x", padx=(0, 10))
+        self.btn_talk.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
         self.btn_listen = tk.Button(
-            bottom, text="🔊   ASCOLTA", font=self.f_btn,
-            fg=COL_TEXT, bg=COL_PANEL, activebackground="#222b38",
+            bottom, text="ascolta", font=self.f_btn,
+            fg=COL_TEXT, bg=COL_PANEL, activebackground=COL_LINE,
             activeforeground=COL_TEXT, relief="flat", bd=0,
-            padx=40, pady=20, cursor="hand2",
+            padx=40, pady=18, cursor="hand2", highlightthickness=0,
             state="disabled", command=self.on_listen,
         )
-        self.btn_listen.pack(side="left", expand=True, fill="x", padx=(10, 0))
+        self.btn_listen.pack(side="left", expand=True, fill="x", padx=(8, 0))
 
-        # --- Barra di stato ---
+        # --- Riga di stato testuale ---
+        self.lbl_status = tk.Label(self.root, text="avvio del modello...",
+                                   font=self.f_small, fg=COL_MUTE, bg=COL_BG)
+        self.lbl_status.pack(pady=(0, 6))
+
+        # --- Indicatori di stato dei servizi (in fondo) ---
         statusbar = tk.Frame(self.root, bg=COL_PANEL)
         statusbar.pack(fill="x", side="bottom")
-        self.dot = tk.Label(statusbar, text="●", font=self.f_status,
-                            fg=COL_DANGER, bg=COL_PANEL)
-        self.dot.pack(side="left", padx=(14, 6), pady=6)
-        self.lbl_status = tk.Label(statusbar, text="Avvio del modello...",
-                                   font=self.f_status, fg=COL_MUTE, bg=COL_PANEL)
-        self.lbl_status.pack(side="left", pady=6)
+        inner = tk.Frame(statusbar, bg=COL_PANEL)
+        inner.pack(pady=12)
+
+        for name in ("modello", "whisper", "microfono"):
+            self._make_indicator(inner, name)
+
+    def _make_indicator(self, parent, name):
+        """Crea un indicatore: pallino + etichetta."""
+        cell = tk.Frame(parent, bg=COL_PANEL)
+        cell.pack(side="left", padx=22)
+        dot = tk.Label(cell, text="\u25cf", font=self.f_ind,
+                       fg=COL_DIM, bg=COL_PANEL)
+        dot.pack(side="left", padx=(0, 7))
+        lbl = tk.Label(cell, text=name, font=self.f_ind,
+                       fg=COL_MUTE, bg=COL_PANEL)
+        lbl.pack(side="left")
+        self.indicators[name] = dot
 
     # ---------- HELPER INTERFACCIA ----------
+    def _set_indicator(self, name, color):
+        """Cambia il colore di un indicatore (thread-safe)."""
+        dot = self.indicators.get(name)
+        if dot is not None:
+            self.root.after(0, lambda: dot.config(fg=color))
+
     def _set_text(self, content, muted=False):
-        """Aggiorna il testo nella card della risposta."""
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", content)
@@ -303,37 +301,64 @@ class VoiceAssistantApp:
         self.txt.tag_add("all", "1.0", "end")
         self.txt.config(state="disabled")
 
-    def _status(self, text, color=COL_MUTE, dot=COL_MUTE):
-        """Aggiorna la barra di stato (thread-safe via after)."""
-        def upd():
-            self.lbl_status.config(text=text, fg=color)
-            self.dot.config(fg=dot)
-        self.root.after(0, upd)
+    def _status(self, text, color=COL_MUTE):
+        self.root.after(0, lambda: self.lbl_status.config(text=text, fg=color))
 
     def _ui(self, fn):
-        """Esegue una funzione sul thread della GUI."""
         self.root.after(0, fn)
+
+    # ---------- CONTROLLO STATO SERVIZI ----------
+    def _schedule_health_check(self):
+        """Avvia un controllo periodico dello stato dei servizi."""
+        threading.Thread(target=self._check_services, daemon=True).start()
+        self.root.after(5000, self._schedule_health_check)
+
+    def _check_services(self):
+        """Verifica modello, whisper e microfono; aggiorna gli indicatori."""
+        # Modello
+        self._set_indicator("modello", COL_OK if self.llama.is_alive() else COL_ERR)
+        # Whisper: basta che il binario e il modello esistano
+        whisper_ok = os.path.exists(WHISPER) and os.path.exists(WHISPER_MODEL)
+        self._set_indicator("whisper", COL_OK if whisper_ok else COL_ERR)
+        # Microfono: arecord presente e almeno una scheda di cattura
+        self._set_indicator("microfono", COL_OK if self._mic_available() else COL_ERR)
+
+    def _mic_available(self):
+        """True se arecord esiste e rileva un dispositivo di cattura."""
+        if shutil.which("arecord") is None:
+            return False
+        try:
+            out = subprocess.run(["arecord", "-l"], capture_output=True,
+                                 text=True, timeout=5)
+            return "card" in out.stdout
+        except Exception:
+            return False
 
     # ---------- AVVIO SERVER ----------
     def _boot_server(self):
+        self._set_indicator("modello", COL_WARN)  # in avvio
         try:
             self.llama.start()
             if self.llama.wait_ready(timeout=180):
-                self._status("Modello pronto", COL_OK, COL_OK)
+                self._set_indicator("modello", COL_OK)
+                self._status("modello pronto", COL_OK)
                 self._ui(lambda: self._set_text(
-                    "Premi  «PARLA»  e fai la tua domanda.", muted=True))
+                    "Premi  parla  e fai la tua domanda.", muted=True))
             else:
-                self._status("Timeout avvio modello", COL_DANGER, COL_DANGER)
+                self._set_indicator("modello", COL_ERR)
+                self._status("timeout avvio modello", COL_ERR)
         except Exception as e:
-            self._status("Errore avvio modello", COL_DANGER, COL_DANGER)
-            self._ui(lambda: self._set_text(f"⚠  Impossibile avviare il modello:\n\n{e}"))
+            self._set_indicator("modello", COL_ERR)
+            self._status("errore avvio modello", COL_ERR)
+            self._ui(lambda: self._set_text(
+                f"Impossibile avviare il modello:\n\n{e}"))
 
     # ---------- FLUSSO: PARLA ----------
     def on_talk(self):
         if self.busy:
             return
         if not self.llama.is_alive():
-            self._status("Il modello non e' ancora pronto", COL_DANGER, COL_DANGER)
+            self._status("il modello non e' ancora pronto", COL_ERR)
             return
         self.busy = True
         self._set_busy_ui(True)
@@ -342,63 +367,55 @@ class VoiceAssistantApp:
     def _set_busy_ui(self, busy):
         state = "disabled" if busy else "normal"
         self._ui(lambda: self.btn_talk.config(
-            state=state,
-            text="🎙   ...IN ASCOLTO" if busy else "🎙   PARLA"))
+            state=state, text="in ascolto..." if busy else "parla"))
         if busy:
             self._ui(lambda: self.btn_listen.config(state="disabled"))
 
     def _talk_pipeline(self):
-        """Registra -> trascrive -> interroga il modello. Gira in un thread."""
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 wav = os.path.join(tmp, "input.wav")
 
                 # 1) REGISTRAZIONE
-                self._status(f"Registrazione ({self.RECORD_SECONDS}s)... parla ora",
-                             COL_ACCENT2, COL_ACCENT2)
+                self._status(f"registrazione ({self.RECORD_SECONDS}s)... parla ora",
+                             COL_ACCENT2)
                 self._record_audio(wav)
 
-                # 2) TRASCRIZIONE con whisper
-                self._status("Trascrizione in corso...", COL_ACCENT, COL_ACCENT)
+                # 2) TRASCRIZIONE
+                self._status("trascrizione in corso...", COL_ACCENT)
                 question = self._transcribe(wav)
-
                 if not question:
-                    self._status("Non ho capito nulla, riprova", COL_DANGER, COL_DANGER)
+                    self._status("non ho capito nulla, riprova", COL_ERR)
                     self._ui(lambda: self._set_text(
-                        "Non ho rilevato parole. Riprova premendo «PARLA».", muted=True))
+                        "Non ho rilevato parole. Riprova premendo  parla.",
+                        muted=True))
                     return
+                self._ui(lambda: self.lbl_heard.config(
+                    text=f"hai detto: \u201c{question}\u201d"))
 
-                self._ui(lambda: self.lbl_heard.config(text=f"hai detto: \u201c{question}\u201d"))
-
-                # 3) INTERROGAZIONE DEL MODELLO
-                self._status("Il modello sta pensando...", COL_ACCENT, COL_ACCENT)
+                # 3) MODELLO
+                self._status("il modello sta pensando...", COL_ACCENT)
                 answer = self.llama.ask(question)
                 if not answer:
                     answer = "(Il modello non ha prodotto una risposta.)"
-
                 self.last_answer = answer
                 self._ui(lambda: self._set_text(answer))
                 self._ui(lambda: self.btn_listen.config(state="normal"))
-                self._status("Pronto", COL_OK, COL_OK)
-
+                self._status("pronto", COL_OK)
         except Exception as e:
-            self._status("Errore", COL_DANGER, COL_DANGER)
+            self._status("errore", COL_ERR)
             msg = str(e)
-            self._ui(lambda: self._set_text(f"⚠  Si e' verificato un errore:\n\n{msg}"))
+            self._ui(lambda: self._set_text(
+                f"Si e' verificato un errore:\n\n{msg}"))
         finally:
             self.busy = False
             self._set_busy_ui(False)
 
     def _record_audio(self, wav_path):
-        """Registra dal microfono con arecord (16kHz mono, formato per whisper)."""
         cmd = [
-            "arecord",
-            "-D", ARECORD_DEVICE,
-            "-f", "S16_LE",
-            "-r", "16000",
-            "-c", "1",
-            "-d", str(self.RECORD_SECONDS),
-            wav_path,
+            "arecord", "-D", ARECORD_DEVICE,
+            "-f", "S16_LE", "-r", "16000", "-c", "1",
+            "-d", str(self.RECORD_SECONDS), wav_path,
         ]
         self.rec_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -407,21 +424,15 @@ class VoiceAssistantApp:
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
             raise RuntimeError(
                 "Registrazione fallita. Controlla il microfono e ARECORD_DEVICE "
-                "(usa `arecord -l` per vedere i dispositivi).")
+                "(usa `arecord -l`).")
 
     def _transcribe(self, wav_path):
-        """Esegue whisper-cli sul file wav e restituisce il testo trascritto."""
         if not os.path.exists(WHISPER):
             raise FileNotFoundError(f"whisper-cli non trovato:\n{WHISPER}")
         out_base = wav_path + ".out"
         cmd = [
-            WHISPER,
-            "-m", WHISPER_MODEL,
-            "-f", wav_path,
-            "-l", WHISPER_LANG,
-            "-otxt",
-            "-of", out_base,
-            "-np",        # niente stampe di sistema
+            WHISPER, "-m", WHISPER_MODEL, "-f", wav_path,
+            "-l", WHISPER_LANG, "-otxt", "-of", out_base, "-np",
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=180)
@@ -435,35 +446,33 @@ class VoiceAssistantApp:
     def on_listen(self):
         if not self.last_answer:
             return
-        self._ui(lambda: self.btn_listen.config(state="disabled", text="🔊   ...LETTURA"))
+        self._ui(lambda: self.btn_listen.config(
+            state="disabled", text="lettura..."))
         threading.Thread(target=self._speak, daemon=True).start()
 
     def _speak(self):
-        """Legge la risposta ad alta voce con espeak-ng."""
         try:
             subprocess.run(
                 ["espeak-ng", "-v", TTS_VOICE, "-s", str(TTS_SPEED),
                  self.last_answer],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
+                timeout=120)
         except FileNotFoundError:
-            self._status("espeak-ng non installato (sudo apt install espeak-ng)",
-                         COL_DANGER, COL_DANGER)
+            self._status("espeak-ng non installato", COL_ERR)
         except Exception as e:
-            self._status(f"Errore TTS: {e}", COL_DANGER, COL_DANGER)
+            self._status(f"errore tts: {e}", COL_ERR)
         finally:
-            self._ui(lambda: self.btn_listen.config(state="normal", text="🔊   ASCOLTA"))
+            self._ui(lambda: self.btn_listen.config(
+                state="normal", text="ascolta"))
 
     # ---------- USCITA ----------
     def quit_app(self):
-        """Chiude tutto in modo pulito: registrazione, server, finestra."""
         try:
             if self.rec_proc and self.rec_proc.poll() is None:
                 self.rec_proc.terminate()
         except Exception:
             pass
-        self._status("Chiusura...", COL_MUTE, COL_MUTE)
+        self._status("chiusura...", COL_MUTE)
         threading.Thread(target=self._shutdown, daemon=True).start()
 
     def _shutdown(self):
@@ -477,7 +486,6 @@ class VoiceAssistantApp:
 def main():
     root = tk.Tk()
     app = VoiceAssistantApp(root)
-    # Chiusura pulita anche con segnali da terminale (Ctrl+C)
     signal.signal(signal.SIGINT,  lambda s, f: app.quit_app())
     signal.signal(signal.SIGTERM, lambda s, f: app.quit_app())
     root.protocol("WM_DELETE_WINDOW", app.quit_app)
