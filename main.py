@@ -4,8 +4,9 @@
 Assistente vocale offline per Raspberry Pi
 ==========================================
 Parla con un modello AI (Qwen 1.5B) gestito da llama.cpp.
+Interfaccia ottimizzata per schermo VERTICALE 600 x 1024 px.
 
-Catena: microfono -> whisper.cpp (speech-to-text) -> llama-server (AI) -> espeak-ng (text-to-speech)
+Catena: microfono -> whisper.cpp -> llama-server -> espeak-ng
 
 Dipendenze di sistema:
     sudo apt install espeak-ng alsa-utils python3-tk
@@ -49,6 +50,10 @@ WHISPER_LANG   = "it"
 TTS_VOICE = "it"
 TTS_SPEED = 160
 
+# Dimensioni schermo (verticale)
+SCREEN_W = 600
+SCREEN_H = 1024
+
 SYSTEM_PROMPT = (
     "Sei un assistente vocale gentile e conciso. "
     "Rispondi in italiano in modo chiaro e breve, adatto alla lettura ad alta voce."
@@ -68,7 +73,7 @@ COL_MUTE    = "#938d82"   # testo secondario
 COL_DIM     = "#5f5b53"   # indicatore spento
 COL_OK      = "#8bb48a"   # verde soft
 COL_WARN    = "#d8a48f"   # ambra/terracotta
-COL_ERR     = "#c98a82"   # rosso soft (non aggressivo)
+COL_ERR     = "#c98a82"   # rosso soft
 
 
 # ============================================================
@@ -164,7 +169,7 @@ class VoiceAssistantApp:
         self.busy = False
         self.last_answer = ""
         self.rec_proc = None
-        self.indicators = {}   # nome -> pallino
+        self.indicators = {}
 
         self._build_ui()
         threading.Thread(target=self._boot_server, daemon=True).start()
@@ -174,19 +179,25 @@ class VoiceAssistantApp:
     def _build_ui(self):
         self.root.title("Assistente Vocale")
         self.root.configure(bg=COL_BG)
+        # Geometria esplicita 600x1024 + fullscreen come fallback
+        self.root.geometry(f"{SCREEN_W}x{SCREEN_H}+0+0")
         self.root.attributes("-fullscreen", True)
+        self.root.resizable(False, False)
         self.root.bind("<Escape>", lambda e: self.quit_app())
 
-        self.f_title  = tkfont.Font(family="DejaVu Sans", size=26, weight="normal")
-        self.f_sub    = tkfont.Font(family="DejaVu Sans", size=11)
-        self.f_body   = tkfont.Font(family="DejaVu Serif", size=17)
-        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=17)
-        self.f_small  = tkfont.Font(family="DejaVu Sans", size=10)
-        self.f_ind    = tkfont.Font(family="DejaVu Sans", size=10)
+        # Font compatti, adatti a 600px di larghezza
+        self.f_title  = tkfont.Font(family="DejaVu Sans", size=20, weight="normal")
+        self.f_sub    = tkfont.Font(family="DejaVu Sans", size=10)
+        self.f_body   = tkfont.Font(family="DejaVu Serif", size=15)
+        self.f_btn    = tkfont.Font(family="DejaVu Sans", size=16)
+        self.f_small  = tkfont.Font(family="DejaVu Sans", size=9)
+        self.f_ind    = tkfont.Font(family="DejaVu Sans", size=9)
 
-        # --- Barra superiore (minimale) ---
+        PAD = 20  # padding laterale uniforme
+
+        # === RIGA 1: barra superiore (altezza fissa) ===
         topbar = tk.Frame(self.root, bg=COL_BG)
-        topbar.pack(fill="x", padx=48, pady=(34, 18))
+        topbar.pack(fill="x", padx=PAD, pady=(18, 10))
 
         title_wrap = tk.Frame(topbar, bg=COL_BG)
         title_wrap.pack(side="left")
@@ -199,29 +210,70 @@ class VoiceAssistantApp:
             topbar, text="chiudi", font=self.f_btn,
             fg=COL_MUTE, bg=COL_BG, activebackground=COL_PANEL,
             activeforeground=COL_ERR, relief="flat", bd=0,
-            padx=16, pady=8, cursor="hand2",
+            padx=12, pady=6, cursor="hand2",
             highlightthickness=0, command=self.quit_app,
         )
         self.btn_close.pack(side="right")
 
-        # --- Area centrale: la risposta ---
+        # === RIGA 5 (in fondo): indicatori di stato servizi ===
+        # impacchettata PRIMA cosi' resta ancorata in basso
+        statusbar = tk.Frame(self.root, bg=COL_PANEL)
+        statusbar.pack(fill="x", side="bottom")
+        inner = tk.Frame(statusbar, bg=COL_PANEL)
+        inner.pack(pady=10)
+        for name in ("modello", "whisper", "microfono"):
+            self._make_indicator(inner, name)
+
+        # === RIGA 4: riga di stato testuale ===
+        self.lbl_status = tk.Label(self.root, text="avvio del modello...",
+                                   font=self.f_small, fg=COL_MUTE, bg=COL_BG)
+        self.lbl_status.pack(side="bottom", pady=(4, 8))
+
+        # === RIGA 3: pulsanti azione (altezza fissa, ancorati in basso) ===
+        bottom = tk.Frame(self.root, bg=COL_BG)
+        bottom.pack(side="bottom", fill="x", padx=PAD, pady=(0, 6))
+
+        self.btn_talk = tk.Button(
+            bottom, text="parla", font=self.f_btn,
+            fg=COL_BG, bg=COL_ACCENT, activebackground="#bcd0b4",
+            activeforeground=COL_BG, relief="flat", bd=0,
+            pady=20, cursor="hand2", highlightthickness=0,
+            command=self.on_talk,
+        )
+        self.btn_talk.pack(fill="x", pady=(0, 8))
+
+        self.btn_listen = tk.Button(
+            bottom, text="ascolta", font=self.f_btn,
+            fg=COL_TEXT, bg=COL_PANEL, activebackground=COL_LINE,
+            activeforeground=COL_TEXT, relief="flat", bd=0,
+            pady=20, cursor="hand2", highlightthickness=0,
+            state="disabled", command=self.on_listen,
+        )
+        self.btn_listen.pack(fill="x")
+
+        # === RIGA 2: card della risposta (riempie lo spazio rimanente) ===
+        # impacchettata PER ULTIMA con expand: prende solo cio' che avanza
         center = tk.Frame(self.root, bg=COL_BG)
-        center.pack(fill="both", expand=True, padx=48, pady=(0, 22))
+        center.pack(fill="both", expand=True, padx=PAD, pady=(0, 12))
 
         card = tk.Frame(center, bg=COL_CARD, highlightthickness=1,
                         highlightbackground=COL_LINE)
         card.pack(fill="both", expand=True)
 
         cap = tk.Frame(card, bg=COL_CARD)
-        cap.pack(fill="x", padx=30, pady=(24, 4))
+        cap.pack(fill="x", padx=18, pady=(16, 4))
         tk.Label(cap, text="risposta", font=self.f_small,
                  fg=COL_ACCENT, bg=COL_CARD).pack(side="left")
-        self.lbl_heard = tk.Label(cap, text="", font=self.f_small,
-                                  fg=COL_MUTE, bg=COL_CARD)
-        self.lbl_heard.pack(side="right")
+
+        # "hai detto" su riga propria: a 600px non sta accanto al titolo
+        self.lbl_heard = tk.Label(card, text="", font=self.f_small,
+                                  fg=COL_MUTE, bg=COL_CARD, anchor="w",
+                                  wraplength=SCREEN_W - 2 * PAD - 36,
+                                  justify="left")
+        self.lbl_heard.pack(fill="x", padx=18, pady=(0, 2))
 
         txt_wrap = tk.Frame(card, bg=COL_CARD)
-        txt_wrap.pack(fill="both", expand=True, padx=30, pady=(0, 26))
+        txt_wrap.pack(fill="both", expand=True, padx=18, pady=(4, 18))
 
         scroll = tk.Scrollbar(txt_wrap, troughcolor=COL_CARD, bd=0,
                               highlightthickness=0)
@@ -229,58 +281,22 @@ class VoiceAssistantApp:
 
         self.txt = tk.Text(
             txt_wrap, font=self.f_body, fg=COL_TEXT, bg=COL_CARD,
-            wrap="word", relief="flat", bd=0, padx=2, pady=6,
+            wrap="word", relief="flat", bd=0, padx=2, pady=4,
             insertbackground=COL_TEXT, yscrollcommand=scroll.set,
-            highlightthickness=0, spacing3=6,
+            highlightthickness=0, spacing3=5,
         )
         self.txt.pack(side="left", fill="both", expand=True)
         scroll.config(command=self.txt.yview)
         self._set_text("Premi  parla  e fai la tua domanda.", muted=True)
         self.txt.config(state="disabled")
 
-        # --- Pulsanti azione ---
-        bottom = tk.Frame(self.root, bg=COL_BG)
-        bottom.pack(fill="x", padx=48, pady=(0, 20))
-
-        self.btn_talk = tk.Button(
-            bottom, text="parla", font=self.f_btn,
-            fg=COL_BG, bg=COL_ACCENT, activebackground="#bcd0b4",
-            activeforeground=COL_BG, relief="flat", bd=0,
-            padx=40, pady=18, cursor="hand2", highlightthickness=0,
-            command=self.on_talk,
-        )
-        self.btn_talk.pack(side="left", expand=True, fill="x", padx=(0, 8))
-
-        self.btn_listen = tk.Button(
-            bottom, text="ascolta", font=self.f_btn,
-            fg=COL_TEXT, bg=COL_PANEL, activebackground=COL_LINE,
-            activeforeground=COL_TEXT, relief="flat", bd=0,
-            padx=40, pady=18, cursor="hand2", highlightthickness=0,
-            state="disabled", command=self.on_listen,
-        )
-        self.btn_listen.pack(side="left", expand=True, fill="x", padx=(8, 0))
-
-        # --- Riga di stato testuale ---
-        self.lbl_status = tk.Label(self.root, text="avvio del modello...",
-                                   font=self.f_small, fg=COL_MUTE, bg=COL_BG)
-        self.lbl_status.pack(pady=(0, 6))
-
-        # --- Indicatori di stato dei servizi (in fondo) ---
-        statusbar = tk.Frame(self.root, bg=COL_PANEL)
-        statusbar.pack(fill="x", side="bottom")
-        inner = tk.Frame(statusbar, bg=COL_PANEL)
-        inner.pack(pady=12)
-
-        for name in ("modello", "whisper", "microfono"):
-            self._make_indicator(inner, name)
-
     def _make_indicator(self, parent, name):
         """Crea un indicatore: pallino + etichetta."""
         cell = tk.Frame(parent, bg=COL_PANEL)
-        cell.pack(side="left", padx=22)
+        cell.pack(side="left", padx=14)
         dot = tk.Label(cell, text="\u25cf", font=self.f_ind,
                        fg=COL_DIM, bg=COL_PANEL)
-        dot.pack(side="left", padx=(0, 7))
+        dot.pack(side="left", padx=(0, 6))
         lbl = tk.Label(cell, text=name, font=self.f_ind,
                        fg=COL_MUTE, bg=COL_PANEL)
         lbl.pack(side="left")
@@ -288,7 +304,6 @@ class VoiceAssistantApp:
 
     # ---------- HELPER INTERFACCIA ----------
     def _set_indicator(self, name, color):
-        """Cambia il colore di un indicatore (thread-safe)."""
         dot = self.indicators.get(name)
         if dot is not None:
             self.root.after(0, lambda: dot.config(fg=color))
@@ -309,22 +324,16 @@ class VoiceAssistantApp:
 
     # ---------- CONTROLLO STATO SERVIZI ----------
     def _schedule_health_check(self):
-        """Avvia un controllo periodico dello stato dei servizi."""
         threading.Thread(target=self._check_services, daemon=True).start()
         self.root.after(5000, self._schedule_health_check)
 
     def _check_services(self):
-        """Verifica modello, whisper e microfono; aggiorna gli indicatori."""
-        # Modello
         self._set_indicator("modello", COL_OK if self.llama.is_alive() else COL_ERR)
-        # Whisper: basta che il binario e il modello esistano
         whisper_ok = os.path.exists(WHISPER) and os.path.exists(WHISPER_MODEL)
         self._set_indicator("whisper", COL_OK if whisper_ok else COL_ERR)
-        # Microfono: arecord presente e almeno una scheda di cattura
         self._set_indicator("microfono", COL_OK if self._mic_available() else COL_ERR)
 
     def _mic_available(self):
-        """True se arecord esiste e rileva un dispositivo di cattura."""
         if shutil.which("arecord") is None:
             return False
         try:
@@ -336,7 +345,7 @@ class VoiceAssistantApp:
 
     # ---------- AVVIO SERVER ----------
     def _boot_server(self):
-        self._set_indicator("modello", COL_WARN)  # in avvio
+        self._set_indicator("modello", COL_WARN)
         try:
             self.llama.start()
             if self.llama.wait_ready(timeout=180):
@@ -376,12 +385,10 @@ class VoiceAssistantApp:
             with tempfile.TemporaryDirectory() as tmp:
                 wav = os.path.join(tmp, "input.wav")
 
-                # 1) REGISTRAZIONE
                 self._status(f"registrazione ({self.RECORD_SECONDS}s)... parla ora",
                              COL_ACCENT2)
                 self._record_audio(wav)
 
-                # 2) TRASCRIZIONE
                 self._status("trascrizione in corso...", COL_ACCENT)
                 question = self._transcribe(wav)
                 if not question:
@@ -393,7 +400,6 @@ class VoiceAssistantApp:
                 self._ui(lambda: self.lbl_heard.config(
                     text=f"hai detto: \u201c{question}\u201d"))
 
-                # 3) MODELLO
                 self._status("il modello sta pensando...", COL_ACCENT)
                 answer = self.llama.ask(question)
                 if not answer:
